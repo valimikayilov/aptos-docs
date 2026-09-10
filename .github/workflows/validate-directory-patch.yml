@@ -1,0 +1,72 @@
+name: Validate Aptos directory patch
+
+on:
+  push:
+    branches: [validation/aptos-provider-discovery]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI_RUN: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-runner
+        id: install
+      - name: Configure local build
+        run: cp .env.example .env
+      - name: Check changed MDX formatting
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          pnpm exec remark src/content/docs/build/external-resources.mdx src/content/docs/zh/build/external-resources.mdx --output
+          git diff --exit-code -- src/content/docs/build/external-resources.mdx src/content/docs/zh/build/external-resources.mdx
+      - name: Check repository lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm sync && pnpm lint
+      - name: Check Astro types
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm check
+      - name: Build documentation and check links
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        id: build
+        run: pnpm check:links
+      - name: Check served English and Chinese resources
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          test -f dist/server/entry.mjs
+          HOST=127.0.0.1 PORT=4321 node dist/server/entry.mjs > /tmp/aptos-preview.log 2>&1 &
+          preview_pid=$!
+          trap 'kill "$preview_pid"' EXIT
+          for locale in en zh; do
+            path=/build/external-resources
+            if [ "$locale" = zh ]; then path=/zh/build/external-resources; fi
+            curl --fail --silent --show-error --location --retry 20 --retry-connrefused --retry-delay 1 --retry-max-time 30 \
+              "http://127.0.0.1:4321$path" --output "/tmp/aptos-resources-$locale.html"
+          done
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          import hashlib
+          import json
+
+          class Links(HTMLParser):
+              count = 0
+              def handle_starttag(self, tag, attrs):
+                  if tag == "a" and dict(attrs).get("href") == "https://www.chain.love/":
+                      self.count += 1
+
+          for locale, phrase in [("en", "Directory of Aptos infrastructure providers."), ("zh", "Aptos 基础设施供应商目录。")]:
+              html = Path(f"/tmp/aptos-resources-{locale}.html").read_text()
+              parser = Links()
+              parser.feed(html)
+              assert parser.count == 1, (locale, parser.count)
+              assert phrase in html, locale
+              assert all(label in html for label in ["API Type", "Historical Data"]), locale
+              print(json.dumps({"locale": locale, "chainlove_links": parser.count, "description_present": True, "html_sha256": hashlib.sha256(html.encode()).hexdigest()}))
+          PY
